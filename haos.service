@@ -1,0 +1,32 @@
+[Unit]
+Description=Home Assistant OS (QEMU/KVM)
+After=network-online.target
+Wants=network-online.target
+# If the tap/bridge is created by a service, order after it:
+# After=br0.service
+
+[Service]
+Type=forking
+User=root
+Group=root
+
+# Path to your controller script
+ExecStart=/opt/vz/haos_vm/haosctl.sh start
+ExecStop=/opt/vz/haos_vm/haosctl.sh stop
+
+# The script writes its own PID file
+PIDFile=/run/qemu-haos.pid
+
+# Restart options
+Restart=always
+RestartSec=5
+
+# Ensure sockets and PID are cleaned on restart
+RuntimeDirectory=qemu-haos
+RuntimeDirectoryMode=0755
+
+# Allow enough time for clean QMP shutdown
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
