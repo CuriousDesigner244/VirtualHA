@@ -1,57 +1,43 @@
-#!/bin/bash
-#i##########################################
-# Home Assistant OS QEMU Controller
-#
-# All-in-one management script
-# Note: fixed VM name 
+#!/usr/bin/env bash
+# HAOS QEMU controller - Stage A (test candidate; not installed automatically)
+set -Eeuo pipefail
 
-# startscript and service file as genertaed by ChatGPT
-# https://chatgpt.com/c/68ed2905-6af8-8328-9594-7741a3a9f0c0
-
-# Notes:
-# console=ttyAMA0 console=tty0
-# addad staus_vm() for debug info
-# digging some config info and qemu info
-# tty0 needed by EFI if booting in grapical console
-
-############################################
-# CONFIGURATION
-############################################
-
-VM_NAME="haos"
-BASE="/opt/vz/haos_vm/16.3"
-
+VM_NAME=haos
+BASE=/opt/vz/haos_vm/16.3
 QCOW="$BASE/haos_generic-aarch64-16.3.qcow2"
 KERNEL="$BASE/haos_kernel/Image"
-PARTUUID="8d3d53e3-6d49-4c38-8349-aff6859e82fd"
-EFI="/usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
-
+EFI=/usr/share/qemu-efi-aarch64/QEMU_EFI.fd
+PARTUUID=8d3d53e3-6d49-4c38-8349-aff6859e82fd
 RAM_MB=2048
+MONITOR_SOCK=/run/qemu-haos-monitor.sock
+CONSOLE_SOCK=/run/qemu-haos-console.sock
+LOGFILE="$BASE/qemu_haos.log"
 
-# SkyConnect USB
-USB_VENDOR="0x10c4"
-USB_PRODUCT="0xea60"
-USE_USB=true   # set to false to disable usb-host
+require_root() {
+    if (( EUID != 0 )); then
+        echo 'ERROR: this action requires root (sudo).' >&2
+        exit 1
+    fi
+}
 
-# RS485
-# 1a86:7523 QinHeng Electronics CH340 serial converter
-
-# Runtime sockets
-MONITOR_SOCK="/run/qemu-$VM_NAME-monitor.sock"
-CONSOLE_SOCK="/run/qemu-$VM_NAME-console.sock"
-PIDFILE="/run/qemu-$VM_NAME.pid"
-
-LOGFILE="$BASE/qemu_${VM_NAME}.log"
-
-# CMD array for VM start command
-CMD=()
-
-############################################
-# INTERNAL QEMU COMMAND BUILDE
-# bugfix 
-# nowait => wait=off
-# \ in () topreserve "
-############################################
+check_network() {
+    local i master
+    for ((i=0; i<30; i++)); do
+        if ip link show br0 >/dev/null 2>&1 &&
+           ip link show tap0 >/dev/null 2>&1; then
+            master=$(basename "$(readlink -f /sys/class/net/tap0/master 2>/dev/null || true)")
+            if [[ "$master" == br0 ]] &&
+               ip -o link show tap0 | grep -q '<[^>]*UP' &&
+               ip -o link show br0 | grep -q '<[^>]*UP'; then
+                echo 'Network ready: tap0 attached to br0; both administratively UP.'
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    echo 'ERROR: tap0/br0 not ready. Inspect nmcli connection show --active and bridge link show.' >&2
+    return 1
+}
 
 build_qemu_cmd() {
     CMD=(
@@ -63,182 +49,78 @@ build_qemu_cmd() {
         -bios "$EFI"
         -kernel "$KERNEL"
         -append "console=ttyAMA0 root=PARTUUID=$PARTUUID rootwait zram.enabled=1 zram.num_devices=3 systemd.machine_id=00000000000000000000000000000000 fsck.repair=yes systemd.condition-first-boot=true rauc.slot=A"
-        -drive id=hd,if=none,format=qcow2,file="$QCOW"
+        -drive "id=hd,if=none,format=qcow2,file=$QCOW"
         -device virtio-blk-pci,drive=hd
-
-        # NETWORK
         -netdev tap,id=net0,ifname=tap0,script=no,downscript=no
         -device virtio-net-pci,netdev=net0
-
-        # SERIAL CONSOLE (UNIX SOCKET)
-        -chardev socket,id=con0,path="$CONSOLE_SOCK",server=on,wait=off
+        -chardev "socket,id=con0,path=$CONSOLE_SOCK,server=on,wait=off"
         -serial chardev:con0
-
-        # QMP MONITOR, HMP mode (readline
-        #-qmp unix:"$MONITOR_SOCK",server=on,wait=off,mode=readline
-        -monitor unix:"$MONITOR_SOCK",server=on,wait=off
-
-        # LOG
+        -monitor "unix:$MONITOR_SOCK,server=on,wait=off"
         -D "$LOGFILE"
-
-        # HEADLESS
         -nographic
+        -device qemu-xhci
+        -device usb-host,vendorid=0x10c4,productid=0xea60
     )
-
-    # Optional USB passthrough
-    if [ "$USE_USB" = true ]; then
-        CMD+=(-device "qemu-xhci")
-        CMD+=(-device "usb-host,vendorid=$USB_VENDOR,productid=$USB_PRODUCT")
-    fi
-    # more USB devices...?
 }
 
-############################################
-# ACTIONS
-############################################
-
-start_vm() {
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "VM already running (PID $(cat "$PIDFILE"))."
-        exit 0
+run_vm() {
+    require_root
+    check_network
+    [[ -f "$QCOW" && -f "$KERNEL" && -f "$EFI" ]] || {
+        echo 'ERROR: Missing QCOW2, kernel or EFI file.' >&2
+        exit 1
+    }
+    # Refuse to touch sockets if the existing manually launched VM is still running.
+    if pgrep -af "^qemu-system-aarch64 -name $VM_NAME( |$)" >/dev/null; then
+        echo "ERROR: $VM_NAME QEMU is already running. Stop it before systemd handover." >&2
+        exit 1
     fi
-
-    echo "Starting HAOS virtual machine..."
-    rm -f "$MONITOR_SOCK" "$CONSOLE_SOCK"
-
+    rm -f -- "$MONITOR_SOCK" "$CONSOLE_SOCK"
     build_qemu_cmd
-
-    MAX_ATTEMPTS=10
-
-    for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-        echo "Attempt $attempt: starting process..."
-
-        # Start the process in background
-	"${CMD[@]}" &
-        PID=$!
-
-        # Wait for startup or failure
-	sleep 1
-        if  kill -0 "$PID" 2>/dev/null; then
-            echo "$PID" > "$PIDFILE"
-            echo "VM started with PID $PID"
-            break
-        fi
-
-        wait "$PID"	
-        echo "Process died early. Retrying..."
-	
-    done
+    echo 'Starting HAOS under systemd (foreground QEMU).'
+    exec "${CMD[@]}"
 }
 
 stop_vm() {
-    if [ ! -f "$PIDFILE" ]; then
-        echo "VM not running (no PID file)."
-        exit 1
-    fi
-
-    PID=$(cat "$PIDFILE")
-    if ! kill -0 "$PID" 2>/dev/null; then
-        echo "Stale PID file. Removing."
-        rm -f "$PIDFILE"
-        exit 1
-    fi
-
-    echo "Sending graceful shutdown (HMP system_powerdown)..."
-
-    if [ -S "$MONITOR_SOCK" ]; then
-        #QM-P>HMP
-        #printf '{ "execute": "system_powerdown" }\n' |\
-        printf 'system_powerdown' |\
-        socat - UNIX-CONNECT:"$MONITOR_SOCK"
-    else
-        echo "HMP socket missing. Killing VM directly."
-        kill "$PID"
-        rm -f "$PIDFILE"
-        exit 0
-    fi
-
-    # Wait up to 20 seconds for clean exit
-    for i in {1..20}; do
-        if ! kill -0 "$PID" 2>/dev/null; then
-            echo "VM stopped cleanly."
-            rm -f "$PIDFILE"
-            return
-        fi
-        sleep 1
-    done
-
-    echo "Graceful shutdown timed out. Forcing kill..."
-    kill -9 "$PID"
-    rm -f "$PIDFILE"
-}
-
-monitor_vm() {
-    if [ ! -S "$MONITOR_SOCK" ]; then
-        echo "No monitor socket found."
-        exit 1
-    fi
-    echo "Connecting to QEMU monitor..."
-    #socat - UNIX-CONNECT:"$MONITOR_SOCK"
-    # For iHMP text mode
-    socat -,raw,echo=0 UNIX-CONNECT:"$MONITOR_SOCK"
-}
-
-console_vm() {
-    if [ ! -S "$CONSOLE_SOCK" ]; then
-        echo "No console socket found."
-        exit 1
-    fi
-    echo "Connecting to VM serial console (Ctrl+] to exit)"
-    socat -,raw,echo=0 UNIX-CONNECT:"$CONSOLE_SOCK"
+    require_root
+    [[ -S "$MONITOR_SOCK" ]] || {
+        echo 'ERROR: HMP socket missing; cannot request graceful shutdown.' >&2
+        return 1
+    }
+    echo 'Requesting HAOS shutdown via QEMU HMP system_powerdown.'
+    # Keep this command short: systemd supervises the actual QEMU process.
+    printf 'system_powerdown\n' | timeout 5 socat -T 2 - "UNIX-CONNECT:$MONITOR_SOCK" >/dev/null
+    # Do not kill QEMU here. systemd waits for ExecStart's process to exit.
 }
 
 status_vm() {
-    echo "### HAOS VM Config (this script config)
-    VM name  : $VM_NAME
-    BASE     : $BASE
-    Disk     : $QCOW
-    KERNEL   : $KERNEL
-    PARTUUID : $PARTUUID
-    EFI boot : $EFI
-    LOGFILE  : $LOGFILE "
-    #MONITOR_SOCK="/run/qemu-$VM_NAME-monitor.sock"
-    #CONSOLE_SOCK="/run/qemu-$VM_NAME-console.sock"
-    #PIDFILE  : cat "/run/qemu-$VM_NAME.pid"
-
-
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "VM is running (PID $(cat "$PIDFILE"))."
-    else
-        echo "VM is stopped."
-    fi
-    if [ -S "$MONITOR_SOCK" ]; then
-        printf '### QEMU status ###'
-        echo 'info status
-        info name
-        info usb
-        info cpus'|\
-        socat - UNIX-CONNECT:"$MONITOR_SOCK"
-    fi
-    echo "### haos/qemu related proesses ###"
-    pgrep -la haosctl
-    pgrep -la qemu |\
-    awk '{print($1 " " $2 " " $3 " " $4 " " $5 " " $6 " ...")}' 
-
+    systemctl status haos.service --no-pager 2>/dev/null || true
+    echo '--- Network ---'
+    ip -br link show br0 tap0 2>/dev/null || { ip -br link show br0 2>/dev/null || true; ip -br link show tap0 2>/dev/null || true; }
+    bridge link show dev tap0 2>/dev/null || true
+    echo '--- QEMU ---'
+    pgrep -af '[q]emu-system-aarch64' || true
+    echo '--- Sockets ---'
+    ls -l "$MONITOR_SOCK" "$CONSOLE_SOCK" 2>/dev/null || true
 }
 
-############################################
-# MAIN
-############################################
+connect_socket() {
+    local sock=$1
+    [[ -S "$sock" ]] || { echo "Socket not found: $sock" >&2; return 1; }
+    exec socat -,raw,echo=0 "UNIX-CONNECT:$sock"
+}
 
-case "$1" in
-    start) start_vm ;;
+case "${1:-}" in
+    run) run_vm ;;
+    check-network) check_network ;;
     stop) stop_vm ;;
     status) status_vm ;;
-    console) console_vm ;;
-    monitor) monitor_vm ;;
-    *)
-        echo "Usage: $0 {start|stop|status|console|monitor}"
-        exit 1
+    console) connect_socket "$CONSOLE_SOCK" ;;
+    monitor) connect_socket "$MONITOR_SOCK" ;;
+    show-command)
+        build_qemu_cmd
+        printf '%q ' "${CMD[@]}"
+        printf '\n'
         ;;
+    *) echo "Usage: $0 {run|check-network|stop|status|console|monitor|show-command}" >&2; exit 2 ;;
 esac
