@@ -1,0 +1,10 @@
+# Hantera alla textfiler automatiskt
+* text=auto
+
+# Tvinga Ubuntu/Linux-skript att alltid använda LF
+*.sh text eol=lf
+*.py text eol=lf
+
+# Låt dokumentation använda LF i arkivet (fungerar fint i både Windows och Ubuntu)
+*.md text eol=lf
+

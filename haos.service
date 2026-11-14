@@ -1,16 +1,20 @@
 [Unit]
-Description=Home Assistant OS 16.3 on QEMU/KVM (Rock 4SE)
+Description=Home Assistant OS 16.3+ in QEMU/KVM
 Wants=network-online.target
 After=NetworkManager.service network-online.target
 
 [Service]
 Type=exec
+
 ExecStart=/opt/vz/haos_vm/haosctl.sh run
 ExecStop=/opt/vz/haos_vm/haosctl.sh stop
+
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+
 TimeoutStartSec=60
-TimeoutStopSec=180
+TimeoutStopSec=160
+
 KillMode=control-group
 
 [Install]
